@@ -1,0 +1,5 @@
+{
+  "name": "Sonoff BMT01 BBQ Thermometer",
+  "homeassistant": "2025.2.0",
+  "render_readme": true
+}

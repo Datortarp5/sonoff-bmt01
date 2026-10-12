@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sonoff BMT01",
+        "description": "Connect your SONOFF BMT01 thermometer over Bluetooth.\n\n1. Switch the thermometer on and close the eWeLink app on your phone (the thermometer allows only one connection).\n2. Choose the thermometer from the list. It shows as ck_ followed by its eWeLink device ID. Or type its Bluetooth address.\n3. Paste the apikey of the eWeLink account it is paired to.\n\nHow to find the key: [setup guide](https://github.com/Datortarp5/sonoff-bmt01#step-1-get-the-ewelink-key)",
+        "data": {
+          "address": "Bluetooth address",
+          "key": "eWeLink key"
+        },
+        "data_description": {
+          "address": "Usually listed automatically as ck_… when the thermometer is on and in range.",
+          "key": "The eWeLink apikey (UUID format). If it is rejected, try the devicekey instead."
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "Enter the address as AA:BB:CC:DD:EE:FF",
+      "invalid_key": "The key cannot be empty"
+    },
+    "abort": {
+      "already_configured": "This thermometer is already set up"
+    }
+  }
+}
