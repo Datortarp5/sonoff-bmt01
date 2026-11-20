@@ -1,7 +1,4 @@
-"""Persistent BLE connection to a Sonoff BMT01.
-
-Works with local adapters and ESPHome Bluetooth proxies (active mode).
-"""
+"""Persistent, authenticated BLE connection to a Sonoff BMT01."""
 
 from __future__ import annotations
 
@@ -27,6 +24,9 @@ from .const import (
     NOTIFY_UUID,
     RECONNECT_DELAYS,
     RESPONSE_TIMEOUT,
+    SYNC_TIMEOUT,
+    TELEMETRY_TIMEOUT,
+    TICKET_MAX_AGE,
     TICKET_TIMEOUT,
     WRITE_UUID,
 )
@@ -38,11 +38,14 @@ from .protocol import (
     CMD_BATTERY_LEVEL_REQUEST,
     CMD_BATTERY_LEVEL_RESPONSE,
     CMD_PROBE_TEMPERATURE_RESPONSE,
+    FLAG_RESPONSE,
+    FLAG_STREAM,
     HEARTBEAT,
     PROBE_COUNT,
     SYNC_REQUEST,
     SYNC_RESPONSE,
     BMT01Crypto,
+    FrameBuffer,
     ProbeValue,
     build_control,
     decode_probe_frame,
@@ -50,7 +53,6 @@ from .protocol import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
 CHUNK_SIZE = 20
 
 
@@ -72,28 +74,42 @@ class BMT01Client:
         self._client: BleakClientWithServiceCache | None = None
         self._task: asyncio.Task | None = None
         self._battery_task: asyncio.Task | None = None
+        self._confirm_task: asyncio.Task | None = None
         self._stopping = False
         self._authenticated = False
+        self._synced = False
         self._app_uuid = ""
-        self._rx_buf = bytearray()
+        self._rx_buffers: dict[int, FrameBuffer] = {}
         self._auth_event = asyncio.Event()
-        self._auth_error: str | None = None
+        self._sync_event = asyncio.Event()
+        self._auth_error: Exception | None = None
         self._disconnected = asyncio.Event()
         self._last_tsn: int | None = None
+        self._ticket_generation = 0
+        self._consumed_generation = 0
+        self._ticket_time = 0.0
+        self._last_telemetry_time = 0.0
         self._tsn_event = asyncio.Event()
+        self._command_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
         self._battery_future: asyncio.Future[int] | None = None
+        self._battery_tsn: int | None = None
         self._listeners: list[CALLBACK_TYPE] = []
-
-    # ------------------------------------------------------------------ state
 
     @property
     def connected(self) -> bool:
-        """True while connected and authenticated."""
-        return self._authenticated and self._client is not None
+        """True while the current link is authenticated and synchronized."""
+        return bool(
+            self._authenticated
+            and self._synced
+            and self._client is not None
+            and self._client.is_connected
+            and not self._disconnected.is_set()
+        )
 
     @callback
     def async_add_listener(self, update_callback: CALLBACK_TYPE) -> Callable[[], None]:
-        """Register an update callback; returns a function that removes it."""
+        """Register an update callback."""
         self._listeners.append(update_callback)
 
         def remove() -> None:
@@ -107,8 +123,6 @@ class BMT01Client:
         for update_callback in list(self._listeners):
             update_callback()
 
-    # ------------------------------------------------------------------ lifecycle
-
     def start(self, entry: ConfigEntry) -> None:
         """Start the background connection loop."""
         self._entry = entry
@@ -117,14 +131,14 @@ class BMT01Client:
         )
 
     async def stop(self) -> None:
-        """Stop the loop and disconnect."""
+        """Cancel the connection loop and all session work."""
         self._stopping = True
-        for task in (self._battery_task, self._task):
-            if task:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        await self._disconnect()
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        await self._cleanup_session()
 
     async def _run(self) -> None:
         attempt = 0
@@ -145,19 +159,40 @@ class BMT01Client:
             attempt += 1
             await asyncio.sleep(delay)
 
+    def _reset_session_state(self) -> None:
+        self._disconnected = asyncio.Event()
+        self._auth_event = asyncio.Event()
+        self._sync_event = asyncio.Event()
+        self._auth_error = None
+        self._authenticated = False
+        self._synced = False
+        self._app_uuid = ""
+        self._rx_buffers.clear()
+        self.probes = [None] * PROBE_COUNT
+        self._last_tsn = None
+        self._ticket_generation = 0
+        self._consumed_generation = 0
+        self._ticket_time = 0.0
+        self._last_telemetry_time = 0.0
+        self._tsn_event = asyncio.Event()
+
+    def _check_connection(self) -> None:
+        if (
+            self._stopping
+            or self._disconnected.is_set()
+            or self._client is None
+            or not self._client.is_connected
+        ):
+            raise BleakError("thermometer disconnected")
+
     async def _session(self) -> None:
+        self._reset_session_state()
+        self._notify_listeners()
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
         )
         if ble_device is None:
             raise RuntimeError("not in range of any connectable adapter or proxy")
-
-        self._disconnected = asyncio.Event()
-        self._auth_event = asyncio.Event()
-        self._auth_error = None
-        self._rx_buf.clear()
-        self._last_tsn = None
-        self._tsn_event = asyncio.Event()
 
         client = await establish_connection(
             BleakClientWithServiceCache,
@@ -167,57 +202,99 @@ class BMT01Client:
             max_attempts=3,
         )
         self._client = client
+
+        # Bind callbacks to this client so delayed notifications cannot affect
+        # the next session after a reconnect.
+        def notify(characteristic, data: bytearray) -> None:
+            if self._client is client and not self._disconnected.is_set():
+                self._on_notify(characteristic, data)
+
         try:
-            await client.start_notify(NOTIFY_UUID, self._on_notify)
+            await client.start_notify(NOTIFY_UUID, notify)
             try:
-                await client.start_notify(NOTIFY2_UUID, self._on_notify)
+                await client.start_notify(NOTIFY2_UUID, notify)
             except BleakError as err:
                 _LOGGER.debug("%s: secondary notify unavailable: %s", self.address, err)
 
             self._app_uuid = str(uuid.uuid4())
-            await self._send_session(AUTH_REQUEST, self.crypto.aes_encrypt_b64(self._app_uuid))
-
+            await self._send_session(
+                AUTH_REQUEST, self.crypto.aes_encrypt_b64(self._app_uuid)
+            )
             try:
                 await asyncio.wait_for(self._auth_event.wait(), AUTH_TIMEOUT)
             except TimeoutError as err:
                 raise RuntimeError(
-                    "authentication timed out (is the eWeLink app connected to it?)"
+                    "authentication timed out; check key, link and app connection"
                 ) from err
+            self._check_connection()
             if self._auth_error:
-                raise BMT01AuthError(self._auth_error)
+                raise self._auth_error
 
-            _LOGGER.info("%s: connected", self.address)
             self._authenticated = True
+            await self._send_session(SYNC_REQUEST, b"")
+            await asyncio.wait_for(self._sync_event.wait(), SYNC_TIMEOUT)
+            self._check_connection()
+            self._synced = True
+            self._last_telemetry_time = self.hass.loop.time()
+            _LOGGER.info("%s: connected", self.address)
             self._notify_listeners()
-            await self._write(bytes([SYNC_REQUEST, 0x00, 0x00, 0x00]))
 
             if self._entry:
                 self._battery_task = self._entry.async_create_background_task(
                     self.hass, self._battery_loop(), f"sonoff_bmt01_battery_{self.address}"
                 )
 
-            await self._disconnected.wait()
+            while not self._disconnected.is_set():
+                remaining = TELEMETRY_TIMEOUT - (
+                    self.hass.loop.time() - self._last_telemetry_time
+                )
+                if remaining <= 0:
+                    raise RuntimeError("probe telemetry timed out; reconnecting")
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._disconnected.wait(), remaining)
             _LOGGER.info("%s: disconnected", self.address)
         finally:
-            if self._battery_task:
-                self._battery_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._battery_task
-                self._battery_task = None
-            self._authenticated = False
-            await self._disconnect()
-            self._notify_listeners()
+            await self._cleanup_session()
 
-    async def _disconnect(self) -> None:
+    async def _cleanup_session(self) -> None:
+        self._authenticated = False
+        self._synced = False
+        self.probes = [None] * PROBE_COUNT
+        self._disconnected.set()
+        self._auth_event.set()
+        self._sync_event.set()
+        self._tsn_event.set()
+        if self._battery_future and not self._battery_future.done():
+            self._battery_future.cancel()
+        self._battery_future = None
+        self._battery_tsn = None
+        for name in ("_battery_task", "_confirm_task"):
+            task = getattr(self, name)
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                setattr(self, name, None)
         client, self._client = self._client, None
         if client and client.is_connected:
             with contextlib.suppress(Exception):
                 await client.disconnect()
+        self._rx_buffers.clear()
+        self._notify_listeners()
 
-    def _on_disconnect(self, _client) -> None:
+    def _on_disconnect(self, client) -> None:
+        if client is not self._client:
+            return
+        self._authenticated = False
+        self._synced = False
+        self.probes = [None] * PROBE_COUNT
         self._disconnected.set()
-
-    # ------------------------------------------------------------------ battery
+        self._auth_event.set()
+        self._sync_event.set()
+        self._tsn_event.set()
+        if self._battery_future and not self._battery_future.done():
+            self._battery_future.cancel()
+        self._notify_listeners()
 
     async def _battery_loop(self) -> None:
         while True:
@@ -231,120 +308,196 @@ class BMT01Client:
                 await asyncio.sleep(BATTERY_RETRY)
 
     async def _next_ticket(self) -> int:
-        """Wait for the next live probe frame and return its sequence number."""
-        self._tsn_event.clear()
-        await asyncio.wait_for(self._tsn_event.wait(), TICKET_TIMEOUT)
-        if self._last_tsn is None:
-            raise RuntimeError("no ticket")
-        return self._last_tsn
+        """Consume one stream generation received after this command started."""
+        minimum_generation = self._ticket_generation + 1
+        deadline = self.hass.loop.time() + TICKET_TIMEOUT
+        while True:
+            self._check_connection()
+            self._tsn_event.clear()
+            if (
+                self._last_tsn is not None
+                and self._ticket_generation >= minimum_generation
+                and self._ticket_generation > self._consumed_generation
+                and self.hass.loop.time() - self._ticket_time <= TICKET_MAX_AGE
+            ):
+                self._consumed_generation = self._ticket_generation
+                return self._last_tsn
+            remaining = deadline - self.hass.loop.time()
+            if remaining <= 0:
+                raise TimeoutError("no fresh stream ticket")
+            await asyncio.wait_for(self._tsn_event.wait(), remaining)
 
     async def async_request_battery(self, attempts: int = 3) -> int:
-        """Ask the thermometer for its battery level (%)."""
-        for _ in range(attempts):
-            tsn = await self._next_ticket()
-            self._battery_future = self.hass.loop.create_future()
-            try:
-                await self._write(build_control(self.crypto, CMD_BATTERY_LEVEL_REQUEST, tsn))
-                return await asyncio.wait_for(self._battery_future, RESPONSE_TIMEOUT)
-            except TimeoutError:
-                continue
-            finally:
-                self._battery_future = None
-        raise RuntimeError(f"no battery response after {attempts} attempts")
+        """Read battery with a serialized, ticket-matched transaction."""
+        async with self._command_lock:
+            if not self.connected:
+                raise BleakError("thermometer is not ready")
+            for _ in range(attempts):
+                tsn = await self._next_ticket()
+                self._battery_tsn = tsn
+                future = self.hass.loop.create_future()
+                self._battery_future = future
+                try:
+                    await self._write(
+                        build_control(self.crypto, CMD_BATTERY_LEVEL_REQUEST, tsn)
+                    )
+                    return await asyncio.wait_for(future, RESPONSE_TIMEOUT)
+                except TimeoutError:
+                    continue
+                finally:
+                    if not future.done():
+                        future.cancel()
+                    self._battery_future = None
+                    self._battery_tsn = None
+            raise RuntimeError(f"no battery response after {attempts} attempts")
 
-    # ------------------------------------------------------------------ TX
+    async def _write(
+        self,
+        data: bytes,
+        *,
+        session_type: int | None = None,
+        expected_client: BleakClientWithServiceCache | None = None,
+    ) -> None:
+        client = expected_client if expected_client is not None else self._client
+        async with self._write_lock:
+            self._check_connection()
+            if client is not self._client:
+                raise BleakError("session changed before write")
+            characteristic = client.services.get_characteristic(WRITE_UUID)
+            if characteristic is None:
+                raise BleakError("BMT01 write characteristic is missing")
+            properties = characteristic.properties
+            response = "write" in properties
+            if not response and "write-without-response" not in properties:
+                raise BleakError("BMT01 characteristic does not support writes")
 
-    async def _write(self, data: bytes) -> None:
-        if not self._client:
-            raise RuntimeError("not connected")
-        for i in range(0, len(data), CHUNK_SIZE):
-            await self._client.write_gatt_char(
-                WRITE_UUID, data[i : i + CHUNK_SIZE], response=False
+            limit = (
+                max(20, min(512, client.mtu_size - 3))
+                if response
+                else characteristic.max_write_without_response_size
             )
-            await asyncio.sleep(0.05)
-        _LOGGER.debug("%s: TX %s", self.address, data.hex(" "))
+            # Preserve the packet boundaries captured from the working app when
+            # the adapter supports them; retain small-MTU fragmentation otherwise.
+            if session_type == AUTH_REQUEST and len(data) <= limit:
+                packets = [data]
+            elif session_type == AUTH_CONFIRM and limit >= 70 and len(data) == 112:
+                packets = [data[:70], data[70:73], data[73:]]
+            else:
+                size = min(CHUNK_SIZE, limit)
+                if size <= 0:
+                    raise BleakError("invalid GATT write size")
+                packets = [data[i : i + size] for i in range(0, len(data), size)]
+            for packet in packets:
+                self._check_connection()
+                if self._client is not client:
+                    raise BleakError("session changed during write")
+                await client.write_gatt_char(characteristic, packet, response=response)
+                await asyncio.sleep(0.05)
+            _LOGGER.debug("%s: TX type=0x%02X len=%s", self.address, data[0], len(data))
 
-    async def _send_session(self, frame_type: int, body: bytes) -> None:
+    async def _send_session(
+        self, frame_type: int, body: bytes, *, expected_client=None
+    ) -> None:
         header = bytes([frame_type, 0x00]) + struct.pack("<H", len(body))
-        await self._write(header + body)
+        await self._write(
+            header + body, session_type=frame_type, expected_client=expected_client
+        )
 
-    # ------------------------------------------------------------------ RX
-
-    def _on_notify(self, _char, data: bytearray) -> None:
-        data = bytes(data)
-        _LOGGER.debug("%s: RX %s", self.address, data.hex(" "))
-        if len(data) < 2:
+    def _on_notify(self, characteristic, data: bytearray) -> None:
+        handle = characteristic.handle
+        buffer = self._rx_buffers.setdefault(handle, FrameBuffer())
+        try:
+            frames = buffer.feed(bytes(data))
+        except ValueError as err:
+            _LOGGER.debug("%s: invalid notification on %s: %s", self.address, handle, err)
             return
-
-        # The auth challenge can span several notifications: reassemble it
-        if self._rx_buf or (len(data) >= 4 and data[0] == AUTH_CHALLENGE and data[1] == 0x00):
-            self._rx_buf += data
-            if len(self._rx_buf) > 1024:
-                self._rx_buf.clear()
-                return
-            needed = 4 + struct.unpack_from("<H", self._rx_buf, 2)[0]
-            if len(self._rx_buf) < needed:
-                return
-            frame = bytes(self._rx_buf[:needed])
-            self._rx_buf.clear()
-            self._handle_challenge(frame)
-            return
-
-        if data[1] == 0x00:
-            self._handle_session(data)
-        else:
-            self._handle_control(data)
+        for frame in frames:
+            if frame[1] == 0x00:
+                if frame[0] == AUTH_CHALLENGE:
+                    self._handle_challenge(frame)
+                else:
+                    self._handle_session(frame)
+            else:
+                self._handle_control(frame)
 
     def _handle_challenge(self, frame: bytes) -> None:
+        if self._confirm_task is not None or not self._app_uuid:
+            return
         try:
             device_uuid = self.crypto.aes_decrypt_b64(frame[4:].rstrip(b"\x00"))
-        except Exception:  # noqa: BLE001
-            self._auth_error = (
-                "the key is wrong (could not decrypt the device challenge)"
+            uuid.UUID(device_uuid)
+        except (ValueError, UnicodeError):
+            self._auth_error = BMT01AuthError(
+                "could not decrypt a valid device challenge; check the key"
             )
             self._auth_event.set()
             return
         confirm = self.crypto.aes_encrypt_b64(f"{self._app_uuid}_{device_uuid}")
-        self.hass.async_create_task(self._send_session(AUTH_CONFIRM, confirm))
+        self._confirm_task = self.hass.async_create_task(
+            self._send_confirmation(confirm, self._client)
+        )
+
+    async def _send_confirmation(self, confirm: bytes, client) -> None:
+        try:
+            await self._send_session(AUTH_CONFIRM, confirm, expected_client=client)
+        except Exception as err:  # noqa: BLE001
+            self._auth_error = err
+            self._auth_event.set()
 
     def _handle_session(self, data: bytes) -> None:
+        if (
+            len(data) < 4
+            or struct.unpack_from("<H", data, 2)[0] != len(data) - 4
+        ):
+            return
         if data[0] == AUTH_ACCEPTED:
+            if self._confirm_task is None or len(data) != 5:
+                return
+            if data[4] != 0:
+                self._auth_error = BMT01AuthError(
+                    "the thermometer rejected authentication"
+                )
             self._auth_event.set()
-        elif data[0] not in (HEARTBEAT, SYNC_RESPONSE):
+        elif data[0] == SYNC_RESPONSE:
+            if self._authenticated and len(data) == 7:
+                self._sync_event.set()
+        elif data[0] != HEARTBEAT:
             _LOGGER.debug("%s: unhandled session frame 0x%02X", self.address, data[0])
 
     def _handle_control(self, data: bytes) -> None:
+        if not self._authenticated:
+            return
         frame = parse_control(self.crypto, data)
         if frame is None:
-            _LOGGER.debug("%s: undecoded frame %s", self.address, data.hex(" "))
+            _LOGGER.debug("%s: malformed control frame ignored", self.address)
             return
-
-        _LOGGER.debug(
-            "%s: %s flags=0x%02X tsn=%s payload=%s",
-            self.address,
-            frame.name,
-            frame.flags,
-            frame.tsn,
-            frame.payload.hex(" "),
-        )
-
         if frame.command == CMD_PROBE_TEMPERATURE_RESPONSE:
             probes = decode_probe_frame(self.crypto, frame)
             if probes is None:
-                _LOGGER.debug("%s: implausible probe frame ignored", self.address)
+                _LOGGER.debug(
+                    "%s: unsupported probe frame flags=0x%02X",
+                    self.address,
+                    frame.flags,
+                )
                 return
             self.probes = probes
-            # Each live probe frame carries a fresh ticket for commands
-            self._last_tsn = frame.tsn
-            self._tsn_event.set()
+            self._last_telemetry_time = self.hass.loop.time()
+            if frame.flags == FLAG_STREAM:
+                self._last_tsn = frame.tsn
+                self._ticket_generation += 1
+                self._ticket_time = self._last_telemetry_time
+                self._tsn_event.set()
             self._notify_listeners()
-
-        elif frame.command == CMD_BATTERY_LEVEL_RESPONSE and frame.payload:
+        elif (
+            frame.command == CMD_BATTERY_LEVEL_RESPONSE
+            and frame.flags == FLAG_RESPONSE
+            and len(frame.payload) == 1
+            and frame.tsn == self._battery_tsn
+            and self._battery_future is not None
+            and not self._battery_future.done()
+        ):
             level = frame.payload[0]
-            if not 0 <= level <= 100:
-                _LOGGER.debug("%s: battery value %s out of range", self.address, level)
-                return
-            self.battery = level
-            if self._battery_future and not self._battery_future.done():
+            if 0 <= level <= 100:
+                self.battery = level
                 self._battery_future.set_result(level)
-            self._notify_listeners()
+                self._notify_listeners()

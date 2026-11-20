@@ -8,7 +8,7 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import BMT01ConfigEntry
 from .client import BMT01Client
@@ -18,7 +18,7 @@ from .entity import BMT01Entity
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: BMT01ConfigEntry,
-    async_add_entities: AddConfigEntryEntitiesCallback,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the connection sensor."""
     async_add_entities([BMT01ConnectedSensor(entry.runtime_data)])
