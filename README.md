@@ -83,7 +83,7 @@ One device, **BMT01**, with the entities below (entity IDs are the defaults).
 | Probe 1–4 | `sensor.bmt01_probe_1` | °C | ~every 2 s | Unavailable unless that probe reports a temperature |
 | Probe 1–4 status | `sensor.bmt01_probe_1_status` | – | ~every 2 s | See the status values below |
 | Battery | `sensor.bmt01_battery` | % | on connect, then every 30 min | Diagnostic; keeps its last value while the thermometer is off |
-| Connected | `binary_sensor.bmt01_connected` | – | on change | Diagnostic; on while HA holds the Bluetooth link |
+| Connected | `binary_sensor.bmt01_connected` | – | on change | Diagnostic; on after authentication and sync |
 
 ### Probe status values
 
@@ -111,6 +111,7 @@ The status values are passed through exactly as the thermometer reports them:
 - **Proxy slot.** The thermometer holds one of the proxy's connection slots (an ESPHome proxy has 3 by default) for as long as it's on.
 - **Battery.** A permanent connection uses more power than occasional app use. Switch the thermometer off when you're not cooking.
 - **Temperatures are whole °C**, which is the thermometer's resolution. Display °F by changing the entity's unit in Home Assistant; the device's own unit setting isn't used.
+- **Fresh readings.** Probe readings are cleared on disconnect and reconnect. A connection that stops delivering valid probe frames for 20 seconds is closed and retried.
 - **Cooking alerts.** Build target-temperature alerts in Home Assistant automations or Node-RED using the Probe sensors. The thermometer's built-in alarm settings aren't supported.
 
 ## Not supported (yet)
@@ -134,3 +135,23 @@ Built on the reverse-engineering work in the Home Assistant Community threads [S
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Development tests
+
+Run the offline suite with Python 3.12 or newer:
+
+```bash
+python -m pip install cryptography
+python -m unittest discover -s tests -v
+```
+
+The suite executes the protocol and BLE client with synthetic keys and a fake
+Bluetooth link. It covers framing, authentication results, sync, request/reply
+matching, sequence reuse, reconnect cleanup and telemetry timeouts. Home
+Assistant imports are stubbed; these tests do not replace testing on Home
+Assistant with a real local adapter and an active ESPHome proxy.
+
+The validated probe format is decoded once using MD5(key), then read as four
+little-endian Celsius words. Unsupported frames are rejected rather than
+automatically trying a second mask. Additional firmware formats need explicit
+packet fixtures before being enabled.

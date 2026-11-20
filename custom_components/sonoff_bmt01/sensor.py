@@ -9,7 +9,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import BMT01ConfigEntry
 from .client import BMT01Client
@@ -20,7 +20,7 @@ from .protocol import PROBE_COUNT, PROBE_STATUSES, STATUS_OK
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: BMT01ConfigEntry,
-    async_add_entities: AddConfigEntryEntitiesCallback,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up BMT01 sensors."""
     client = entry.runtime_data

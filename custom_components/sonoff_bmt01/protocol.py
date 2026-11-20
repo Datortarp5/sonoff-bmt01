@@ -43,9 +43,8 @@ COMMAND_NAMES = {
 }
 
 FLAG_NEED_RESPONSE = 0x02
-
-# Firmware constant used for the per-probe masks on response frames
-RESP_SECONDARY_KEY = bytes([0x38, 0xA3, 0x50, 0xAD, 0xED, 0x6F, 0x19, 0x76])
+FLAG_RESPONSE = 0x05
+FLAG_STREAM = 0x09
 
 PROBE_COUNT = 4
 
@@ -68,15 +67,6 @@ class BMT01Crypto:
     def __init__(self, key: str) -> None:
         """Derive the AES / XOR key (MD5 of the eWeLink key)."""
         self.key = hashlib.md5(key.strip().encode()).digest()
-        self.resp_masks = [
-            bytes(
-                [
-                    self.key[2 + i * 2] ^ RESP_SECONDARY_KEY[i * 2],
-                    self.key[3 + i * 2] ^ RESP_SECONDARY_KEY[i * 2 + 1],
-                ]
-            )
-            for i in range(PROBE_COUNT)
-        ]
 
     def aes_encrypt_b64(self, text: str) -> bytes:
         """AES-128-CBC encrypt with PKCS7 padding, return base64."""
@@ -88,7 +78,7 @@ class BMT01Crypto:
 
     def aes_decrypt_b64(self, b64: bytes) -> str:
         """Decrypt base64 AES-128-CBC data. Raises ValueError on a wrong key."""
-        ciphertext = base64.b64decode(b64)
+        ciphertext = base64.b64decode(b64, validate=True)
         if not ciphertext or len(ciphertext) % 16:
             raise ValueError("ciphertext length is not a multiple of 16")
         decryptor = Cipher(algorithms.AES(self.key), modes.CBC(AES_IV)).decryptor()
@@ -102,17 +92,6 @@ class BMT01Crypto:
         """XOR with the MD5 key, restarting every 16-byte block."""
         return bytes(b ^ self.key[i % 16] for i, b in enumerate(data))
 
-    def unmask_resp(self, payload: bytes) -> bytes:
-        """Remove the per-probe masks used on response frames."""
-        out = bytearray()
-        for i, mask in enumerate(self.resp_masks):
-            ofs = i * 2
-            if ofs + 1 >= len(payload):
-                break
-            out.append(payload[ofs] ^ mask[0])
-            out.append(payload[ofs + 1] ^ mask[1])
-        return bytes(out)
-
 
 @dataclass
 class ControlFrame:
@@ -120,7 +99,7 @@ class ControlFrame:
 
     command: int
     flags: int
-    source: int  # flags bit0: 1 = device push, 0 = response
+    source: int  # Sender bit; both stream (0x09) and response (0x05) set it.
     tsn: int
     payload: bytes
 
@@ -183,12 +162,32 @@ def _plausible(probes: list[ProbeValue]) -> bool:
 def decode_probe_frame(
     crypto: BMT01Crypto, frame: ControlFrame
 ) -> list[ProbeValue] | None:
-    """Decode a probe frame (push frames are plain, responses are masked)."""
-    candidates = [frame.payload, crypto.unmask_resp(frame.payload)]
-    if frame.source == 0:
-        candidates.reverse()
-    for payload in candidates:
-        probes = decode_probes(payload)
-        if _plausible(probes):
-            return probes
-    return None
+    """Decode the already-decrypted probe body without guessing another mask."""
+    if frame.flags not in (FLAG_STREAM, FLAG_RESPONSE) or len(frame.payload) != 8:
+        return None
+    probes = decode_probes(frame.payload)
+    return probes if _plausible(probes) else None
+
+
+class FrameBuffer:
+    """Reassemble length-prefixed frames for one notification characteristic."""
+
+    def __init__(self, max_payload: int = 1024) -> None:
+        self._buffer = bytearray()
+        self._max_payload = max_payload
+
+    def feed(self, data: bytes) -> list[bytes]:
+        """Retain partial headers/bodies and return every complete frame."""
+        self._buffer.extend(data)
+        frames = []
+        while len(self._buffer) >= 4:
+            length = struct.unpack_from("<H", self._buffer, 2)[0]
+            if length > self._max_payload:
+                self._buffer.clear()
+                raise ValueError("notification payload exceeds frame limit")
+            end = 4 + length
+            if len(self._buffer) < end:
+                break
+            frames.append(bytes(self._buffer[:end]))
+            del self._buffer[:end]
+        return frames
